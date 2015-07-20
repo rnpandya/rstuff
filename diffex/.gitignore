@@ -1,0 +1,5 @@
+vcf
+*.rdata
+*.tsv
+*.csv
+*.txt
