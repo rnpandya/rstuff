@@ -32,7 +32,7 @@ scalenzlog <- function (x) log10(x+1.0)-mean(log10(x[x>0]))
 for (i in 2:length(colnames(gx2))) { gx2[i] <- scalenzlog(gx2[i]) }
 gx2$ensembl_gene_id <- gsub('\\.[0-9]+$','',levels(gx2$feature)[gx2$feature])
 
-dnaRnaMap <- read.table('laml-dna-rna.tsv',sep='\t',header=T,stringsAsFactors=F)
+dnaRnaMap <- read.table('c:/ravip/beataml/r/laml-dna-rna.tsv',sep='\t',header=T,stringsAsFactors=F)
 
 dhsgenenames <- getBM(attributes=c('ensembl_gene_id','hgnc_symbol','entrezgene','description'),values=levels(dhsgene$gene_name),filters='hgnc_symbol',mart=ensembl)
 
@@ -69,8 +69,39 @@ colnames(tfbs_gx_stats) <- c('tfbs_n', 'tfbs_uq', 'tfbs_dhs_n', 'tfbs_dhs_uq', '
 tfbs_gx_stats <- as.data.frame(tfbs_gx_stats)
 tfbs_gx_stats$rna <- sapply(1:length(tfbs_gx_stats$tfbs_n), function (i) dnaRnaMap$rna[1+floor((i-1)/2)])
 tfbs_gx_stats$random <- sapply(1:length(tfbs_gx_stats$tfbs_n), function (i) mod(i,2)==0)
-tfbs_gx <- lapply(tfbs_gx, . %>% .$df)
 tfbs_gx_stats %>% group_by(random) %>% summarise(mult_tfbs=mean(tfbs_dhs_n/tfbs_dhs_uq),mean_gx=mean(gx_mean),mult_dhs=mean(tfbs_dhs_n/tfbs_n))
+tfbs_gx <- lapply(tfbs_gx, . %>% .$df)
+
+tfbs_gx_all <- do.call(rbind, lapply(tfbs_gx,
+      function (x) x %>% gather('sample', 'expr', 9, na.rm=T))) %>%
+  rename(sample=variable, expr=value)
+
+tfbs_gx_stats <- tfbs_gx_all %>% group_by(hgnc_symbol) %>%
+  summarise(sum_ov=sum(sum_ov),mean_ov=mean(sum_ov),median_ov=median(sum_ov),n_ov=n_distinct(sample)) %>% arrange(desc(mean_ov))
+
+tfbs_gx_stats %>% filter(n_ov>2 & mean_ov>3) %>% .$hgnc_symbol %>% unique %>%
+  write.table(col.names=F,row.names=F,quote=F,'c:/ravip/beataml/r/g3.txt')
+
+# run g3.txt through GO enrichment at pantherdb.org
+# 1st & 4th highest fold enrichment are myeloid differentiation
+# genes from GO terms are
+tfbs_myeloid <- c('GAB3', 'CBFA2T3', 'GATA2', 'FOXP1', 'SBNO2', 'IRF4', 'CCR7', 'TGFB1', 'TNFSF9',
+    'EPHA2', 'LTBR', 'JAGN1', 'JMJD6', 'ERCC2', 'RUNX1', 'DNASE2', 'PTPN6', 'HOXB7')
+# samples by #genes with TFBS muts
+tfbs_gx_target <- tfbs_gx_all %>% filter(hgnc_symbol %in% tfbs_myeloid) %>% group_by(sample) %>%
+    summarise(n_targets=n_distinct(hgnc_symbol)) %>% rename(rna=sample)
+
+# aml genes
+aml_genes <- c('NPM1', 'FLT3', 'DNMT3A', 'IDH1', 'IDH2', 'NRSA', 'KRAS', 'RUNX1', 'TET2', 'TP53', 'CEBPA',
+      'WT1', 'PTPN11', 'KIT')
+laml_entrez <- getBM(attributes = "entrezgene", filter="external_gene_name", values = aml_genes, mart=ensembl)
+txdb_laml <- txdb_genes[txdb_genes$gene_id %in% sapply(laml_entrez, as.character),]
+as.granges <- function (g) makeGRangesFromDataFrame(as.data.frame(g))
+laml_ov <- sapply(vcfs, function (v) countOverlaps(as.granges(v), as.granges(txdb_laml)))
+
+mut_targets <- data.frame(n_muts=laml_ov, dna=names(laml_ov)) %>%
+    inner_join(dnaRnaMap) %>% inner_join(tfbs_gx_target)
+ggplot(mut_targets, aes(x=n_muts, y=n_targets)) + geom_bin2d() + geom_density2d()
 
 plots <- lapply(1:2*length(tfbs_gx), function(i) {
     dfx <- tfbs_gx[[floor((i+1)/2)]]
@@ -98,15 +129,17 @@ dev.off()
 # has both GBM data and matched random mutations
 #
 
+#setwd('c:/ravip/pancan/tcga505')
+setwd('d:/sequence/pancan/tcga505')
 gx <- read.table('expression.tsv.gz',sep='\t',stringsAsFactors=F,header=T)
 colnames(gx) <- gsub('\\.', '-', colnames(gx))
-dna <- read.table('c:/ravip/pancan/tcga505/mutations.tsv.gz', sep='\t', header=T, stringsAsFactors=F)
+dna <- read.table('mutations.tsv.gz', sep='\t', header=T, stringsAsFactors=F)
 dna <- makeGRangesFromDataFrame(dna, keep.extra.columns = T, start.field = 'pos', end.field = 'pos')
 seqlevelsStyle(dna) <- 'UCSC'
 barcodes <- unique(dna$barcode)
 scalenzlog <- function (x) log10(x+1.0)-mean(log10(x[x>0]+1))
 for (i in 3:length(colnames(gx))) { gx[i] <- scalenzlog(gx[i]) }
-tfbs_gx <- lapply(1:(length(barcodes)*2), function (i) {
+tfbs_gx <- lapply_par(1:(length(barcodes)*2), function (i) {
     bc <- barcodes[floor((i+1)/2)]
     v <- dna[mcols(dna)$barcode==bc]
     if (mod(i,2)==1) {
@@ -134,3 +167,29 @@ tfbs_gx <- lapply(1:(length(barcodes)*2), function (i) {
     print(stats)
     list(df=result,stats=stats)
 })
+
+#
+# build general map of TF and target genes within some range
+#
+
+df <- read.table("c:/ravip/encode/wgEncodeRegTfbsClusteredV3.bed.gz",sep="\t") %>%
+    rename(chr=V1, start=V2, end=V3, gene=V4)
+tfbs <- makeGRangesFromDataFrame(df, ignore.strand = T, keep.extra.columns = T)
+df <- read.table("c:/ravip/encode/allGeneCorrelations100000.p05.txt.gz",sep="\t",header=TRUE)
+dhsgene <- makeGRangesFromDataFrame(df, seqnames.field = "dhs_chr", start.field = "dhs_start", end.field = "dhs_end", ignore.strand = TRUE, keep.extra.columns = TRUE)
+rm(df)
+ov_ <- findOverlaps(tfbs, dhsgene, maxgap=0)
+tfbs_ <- as.data.frame(tfbs[queryHits(ov_)])
+dhs_ <- as.data.frame(dhsgene[subjectHits(ov_)])
+tfbs_target <- makeGRangesFromDataFrame(data.frame(seqnames=tfbs_$seqnames, start=tfbs_$start, end=tfbs_$end,
+    tf=tfbs_$gene, tf_width=tfbs_$width, target=dhs_$gene_name, cor=dhs_$cor, pval=dhs_$pval), keep.extra.columns=T)
+rm(ov_, tfbs_, dhs_)
+match_regions <- function (v, regions, maxgap=0) {
+    ov_ <- findOverlaps(v, regions, maxgap=maxgap)
+    v_ <- v[queryHits(ov_)]
+    r_ <- regions[subjectHits(ov_)]
+    r_$mut_start <- start(v_)
+    r_$ref <- v_$REF
+    r_$alt <- v_$ALT
+    r_
+}
