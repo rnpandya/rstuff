@@ -131,14 +131,28 @@ dev.off()
 
 #setwd('c:/ravip/pancan/tcga505')
 setwd('d:/sequence/pancan/tcga505')
+
 gx <- read.table('expression.tsv.gz',sep='\t',stringsAsFactors=F,header=T)
 colnames(gx) <- gsub('\\.', '-', colnames(gx))
-dna <- read.table('mutations.tsv.gz', sep='\t', header=T, stringsAsFactors=F)
+scalenzlog <- function (x) {
+  f <- x>0 & ! is.na(x)
+  m <- mean(log10(x[f]+1))
+  ifelse(f, log10(x+1)-m, m)
+}
+gx %<>% mutate_each(funs(scalenzlog), -ENSEMBL_ID, -symbol)
+
+dna <- read.table('mutations.tsv.gz', sep='\t', header=T, stringsAsFactors=T)
 dna <- makeGRangesFromDataFrame(dna, keep.extra.columns = T, start.field = 'pos', end.field = 'pos')
 seqlevelsStyle(dna) <- 'UCSC'
+
+dna_rnd <- read.table('randomised_TCGA505_toshare.txt.gz', header=F, skip=1,
+  col.names=c('barcode', 'cancer', 'chr', 'pos', 'ref_allele', 'var_allele'))
+dna_rnd <- makeGRangesFromDataFrame(dna_rnd, keep.extra.columns = T, start.field = 'pos', end.field = 'pos')
+seqlevelsStyle(dna_rnd) <- 'UCSC'
+
 barcodes <- unique(dna$barcode)
-scalenzlog <- function (x) log10(x+1.0)-mean(log10(x[x>0]+1))
-for (i in 3:length(colnames(gx))) { gx[i] <- scalenzlog(gx[i]) }
+
+#for (i in 3:length(colnames(gx))) { gx[i] <- scalenzlog(gx[i]) }
 tfbs_gx <- lapply_par(1:(length(barcodes)*2), function (i) {
     bc <- barcodes[floor((i+1)/2)]
     v <- dna[mcols(dna)$barcode==bc]
@@ -193,3 +207,144 @@ match_regions <- function (v, regions, maxgap=0) {
     r_$alt <- v_$ALT
     r_
 }
+
+count_tf <- function (v) v %>% as.data.frame %>%
+      select(target, tf, mut_start, tf_width) %>%
+      unique %>%
+      group_by(target) %>%
+      summarise(ntf=length(tf), wtf=sum(tf_width), rtf=length(tf)/sum(tf_width))
+
+s_ <- dna %>% as.data.frame %>% split(., .$barcode)
+dna_tf <- lapply(s_, function (d) {
+    v <- makeGRangesFromDataFrame(d, keep.extra.columns=T)
+    seqlevelsStyle(v) <- 'UCSC'
+    match_regions(v, tfbs_target)
+})
+names(dna_tf) <- names(s_)
+dna_tf_sum <- lapply(dna_tf, count_tf) %>% Reduce(rbind, .)
+dna_tf_sum %>% filter(ntf<50) %>% .$ntf %>% hist(breaks=1:50)
+
+s_ <- split(dna_rnd, dna_rnd$barcode)
+dna_rnd_tf <- lapply(s_, function (d) {
+    v <- makeGRangesFromDataFrame(d, keep.extra.columns=T)
+    seqlevelsStyle(v) <- 'UCSC'
+    match_regions(v, tfbs_target)
+})
+names(dna_rnd_tf) <- names(s_)
+rm(s_)
+dna_rnd_tf_sum <- lapply(dna_rnd_tf, count_tf) %>% Reduce(rbind, .)
+dna_rnd_tf_sum %>% filter(ntf<50) %>% .$ntf %>% hist
+
+dna_tf1 %>% as.data.frame %>%
+  group_by(target) %>%
+  summarise(ntf=length(tf), mean_cor=mean(cor)) %>%
+  filter(ntf>3) %>%
+  .$target %>%
+  unique %>%
+  write.table(file='c:/ravip/beataml/r/dna_tf1.txt', row.names=F, quote=F, col.names=F)
+
+# count tf hits in each sample (.x=donor, .y=random)
+
+# first pass, use inner join
+
+dna_tf_sumall_inner <- names(dna_tf) %>% lapply(function (s)
+        count_tf(dna_tf[[s]]) %>%
+        inner_join(count_tf(dna_rnd_tf[[s]]), by='target') %>%
+        mutate(sample=s, r_ntf=log10(.01+ntf.x/(.01+ntf.y)), rd_ntf=(ntf.x-ntf.y)/ntf.y)) %>%
+    Reduce(rbind, .)
+dna_tf_sumall2_inner <- dna_tf_sumall_inner %>%
+    group_by(target) %>%
+    summarise(n=length(sample), mean_rn=mean(r_ntf), sd_rn=sd(r_ntf), mean_rd=mean(rd_ntf), sd_rd=sd(rd_ntf))
+
+dna_tf_sumall <- names(dna_tf) %>% lapply(function (s)
+        count_tf(dna_tf[[s]]) %>%
+        full_join(count_tf(dna_rnd_tf[[s]]), by='target') %>%
+        mutate(ntf.x=ifelse(is.na(ntf.x),0,ntf.x), ntf.y=ifelse(is.na(ntf.y),0,ntf.y),
+            rtf.x=ifelse(is.na(rtf.x),0,rtf.x), rtf.y=ifelse(is.na(rtf.y),0,rtf.y), sample=s) %>%
+        mutate(r_ntf=logoddsratio(ntf.x, ntf.y), rd_ntf=(ntf.x-ntf.y)/ntf.y, mean_rd=mean(rd_ntf), sd_rd=sd(rd_ntf),
+            r_rtf=logoddsratio(rtf.x, rtf.y))) %>%
+    Reduce(rbind, .)
+# plot shows bias to higher TF mutation counts
+dna_tf_sumall2 <- dna_tf_sumall %>%
+    group_by(target) %>%
+    summarise(n=length(sample), mean_rn=mean(r_ntf), sd_rn=sd(r_ntf), mean_rr=mean(r_rtf), sd_rr=sd(r_rtf))
+
+dna_tf_sumall2 %>%
+    filter(n > 10) %>%
+    ggplot(aes(x=mean_rn)) + geom_histogram(binwidth=.1)
+
+# export to text, run through GO, download to tcga505-go.xlsx
+# filtering for >5 in sample, top fold enrichment terms are all immune system
+# but not not signif w/bonferroni correction - ??
+dna_tf_sumall2 %>%
+  filter(n>10&mean_nd>5) %>%
+  .$target %>%
+  write.table(file='dna_tf_sumall2.txt', row.names=F, quote=F, col.names=F)
+
+# look at outer join, fraction of tf muts in real
+# n>24 is top 3/4 of samples
+dna_tf_sumall %<>% mutate(xf=ntf.x/(ntf.x+ntf.y))
+dna_tf_sumall2a <- dna_tf_sumall %>% group_by(target) %>% summarise(n=length(sample), mean_xf=mean(xf), sd_xf=sd(xf), iqr_xf=IQR(xf))
+dna_tf_sumall2a %>% filter(n>=24) %>% ggplot(aes(x=mean_xf,y=sd_xf)) + geom_point(aes(size=n))
+
+# simply look at targets w/most TF muts
+dna_tf_sumall %>%
+    filter(ntf.x >= 9) %>% # top quartile
+    group_by(target) %>%
+    summarize(n=length(sample), mean_ntf=mean(ntf.x)) %>% arrange(desc(n)) %>%
+    head(.01*length(.$n)) %>%
+    .$target %>%
+    write.table(file='dna_tf_sumall-freq.txt',row.names=F, quote=F, col.names=F)
+# enriched for chromatin organization, cell cycle, apoptosis, cancer regulation, cellular response to stress
+
+#
+# now trying predictive mapping from pathways
+#
+
+target_ids <- getBM(attributes=c('hgnc_symbol', 'ensembl_gene_id', 'entrezgene'), filters='hgnc_symbol', values=unique(tfbs_target$target), mart=ensembl) %>%
+    as.data.frame %>%
+    mutate(entrezgene=as.integer(entrezgene))
+
+kegg_path <- read.table('c:/ravip/rstuff/regmut/cancer_kegg.csv',sep=',',header=T) %>%
+    inner_join(KEGGPATHID2EXTID %>% as.data.frame) %>%
+    rename(entrezgene=gene_or_orf_id) %>%
+    mutate(entrezgene=as.integer(entrezgene))
+
+target_path <- target_ids %>% inner_join(kegg_path)
+barcode_cancer <- dna %>% as.data.frame %>% select(barcode,cancer) %>% unique
+
+dna_tf_sumpath <- names(dna_tf) %>%
+    lapply(function (s) {
+        cancer_code <- (barcode_cancer %>% filter(barcode == s) %>% .$cancer)[[1]]
+        targets <- target_path %>% filter(cancer == cancer_code) %>% .$hgnc_symbol
+        count_tf(dna_tf[[s]]) %>%
+            mutate(in_pathway=target %in% targets) %>%   
+            full_join(count_tf(dna_rnd_tf[[s]]), by='target') %>%
+            mutate(ntf.x=ifelse(is.na(ntf.x),0,ntf.x), ntf.y=ifelse(is.na(ntf.y),0,ntf.y),
+                rtf.x=ifelse(is.na(rtf.x),0,rtf.x), rtf.y=ifelse(is.na(rtf.y),0,rtf.y),
+                sample=s, cancer=cancer_code) %>%
+            mutate(r_ntf=logoddsratio(ntf.x, ntf.y), rd_ntf=(ntf.x-ntf.y)/ntf.y, mean_rd=mean(rd_ntf), sd_rd=sd(rd_ntf),
+                r_rtf=logoddsratio(rtf.x, rtf.y))}) %>%
+    Reduce(rbind, .)
+# ok, this pretty much disproves my hypothesis - these graphs look very similar
+dna_tf_sumpath %>%
+    filter(abs(r_ntf)<6) %>%
+    ggplot(aes(x=r_ntf)) + geom_histogram(binwidth=.1) + facet_grid(in_pathway ~ ., scales='free')
+
+#
+# try predicting random vs. cancer
+# based on vector of ntf by target gene
+#
+
+# todo: gather should do this, couldn't figure out how
+dna_tf_rfin <- dna_tf_sumall %>% select(target, sample, ntf.x) %>% rename(ntf=ntf.x) %>% mutate(rnd=F) %>%
+    rbind(dna_tf_sumall %>% select(target, sample, ntf.y) %>% rename(ntf=ntf.y) %>% mutate(rnd=T)) %>%
+    spread(target, ntf) %>%
+    rename(barcode=sample) %>%
+    join(barcode_cancer) %>%
+    mutate(flag=1) %>%
+    spread(cancer,flag) %>%
+    select(-barcode)
+
+write.table(dna_tf_rfin, file='dna_tf_rfin.csv',row.names=F,quote=F,sep=',')
+
