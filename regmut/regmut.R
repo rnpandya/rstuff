@@ -140,17 +140,21 @@ scalenzlog <- function (x) {
   ifelse(f, log10(x+1)-m, m)
 }
 gx %<>% mutate_each(funs(scalenzlog), -ENSEMBL_ID, -symbol)
-
-dna <- read.table('mutations.tsv.gz', sep='\t', header=T, stringsAsFactors=T)
-dna <- makeGRangesFromDataFrame(dna, keep.extra.columns = T, start.field = 'pos', end.field = 'pos')
+ROWLIMIT=10000 # -1 for all
+dna <- read.table('d:/sequence/pancan/tcga505/mutations.tsv.gz', sep='\t', header=T, stringsAsFactors=T, nrows=ROWLIMIT) %>%
+  makeGRangesFromDataFrame(keep.extra.columns = T, start.field = 'pos', end.field = 'pos')
 seqlevelsStyle(dna) <- 'UCSC'
 
-dna_rnd <- read.table('randomised_TCGA505_toshare.txt.gz', header=F, skip=1,
-  col.names=c('barcode', 'cancer', 'chr', 'pos', 'ref_allele', 'var_allele'))
-dna_rnd <- makeGRangesFromDataFrame(dna_rnd, keep.extra.columns = T, start.field = 'pos', end.field = 'pos')
+dna_rnd <- read.table('d:/sequence/pancan/tcga505/randomised_TCGA505_toshare.txt.gz', header=F, skip=1,
+        col.names=c('barcode', 'cancer', 'chr', 'pos', 'ref_allele', 'var_allele'), nrows=ROWLIMIT) %>%
+    makeGRangesFromDataFrame(keep.extra.columns = T, start.field = 'pos', end.field = 'pos')
 seqlevelsStyle(dna_rnd) <- 'UCSC'
 
 barcodes <- unique(dna$barcode)
+
+dna_all <- dna_rnd %>% as.data.frame %>% mutate(var_freq=NA, varscan_p=NA, rnd=T) %>%
+    rbind(dna %>% as.data.frame %>% mutate(rnd=F)) %>%
+    makeGRangesFromDataFrame(keep.extra.columns=T)
 
 #for (i in 3:length(colnames(gx))) { gx[i] <- scalenzlog(gx[i]) }
 tfbs_gx <- lapply_par(1:(length(barcodes)*2), function (i) {
@@ -198,15 +202,6 @@ dhs_ <- as.data.frame(dhsgene[subjectHits(ov_)])
 tfbs_target <- makeGRangesFromDataFrame(data.frame(seqnames=tfbs_$seqnames, start=tfbs_$start, end=tfbs_$end,
     tf=tfbs_$gene, tf_width=tfbs_$width, target=dhs_$gene_name, cor=dhs_$cor, pval=dhs_$pval), keep.extra.columns=T)
 rm(ov_, tfbs_, dhs_)
-match_regions <- function (v, regions, maxgap=0) {
-    ov_ <- findOverlaps(v, regions, maxgap=maxgap)
-    v_ <- v[queryHits(ov_)]
-    r_ <- regions[subjectHits(ov_)]
-    r_$mut_start <- start(v_)
-    r_$ref <- v_$REF
-    r_$alt <- v_$ALT
-    r_
-}
 
 count_tf <- function (v) v %>% as.data.frame %>%
       select(target, tf, mut_start, tf_width) %>%
@@ -296,7 +291,7 @@ dna_tf_sumall %>%
     .$target %>%
     write.table(file='dna_tf_sumall-freq.txt',row.names=F, quote=F, col.names=F)
 # enriched for chromatin organization, cell cycle, apoptosis, cancer regulation, cellular response to stress
-
+,.
 #
 # now trying predictive mapping from pathways
 #
@@ -346,5 +341,156 @@ dna_tf_rfin <- dna_tf_sumall %>% select(target, sample, ntf.x) %>% rename(ntf=nt
     spread(cancer,flag) %>%
     select(-barcode)
 
-write.table(dna_tf_rfin, file='dna_tf_rfin.csv',row.names=F,quote=F,sep=',')
+#
+# Ernst enh-prom files
+#
 
+setwd('c:/ravip/rstuff/regmut/data/ernst')
+ernst <- list.files(, '*.txt') %>% lapply(function (f)
+    read.table(f, sep='\t', quote=NULL, header=F, col.names=c('seqnames', 'start', 'end', 'refseqtx')) %>%
+        mutate(cellline=strsplit(f, '_')[[1]][2], chromstate=paste(strsplit(f, '_')[[1]][3], strsplit(f, '_')[[1]][4], sep='_'))) %>%
+    Reduce(rbind, .) %>%
+    makeGRangesFromDataFrame(keep.extra.columns=T)
+ernst$enh_width <- width(ernst)
+
+#
+# He enh-prom files
+#
+
+he <- list.files('c:/ravip/rstuff/regmut/data/he', '*.csv', full.names=T) %>% lapply(function (f)
+        read.table(f, skip=1,header=T,quote='"',sep=',') %>%
+            rename(seqnames=Chr, start=Start, end=End, tss.seqnames=Chr.1, tss.start=TSS, tss.strand=Strand, promoter=ID) %>%
+            mutate(cellline=strsplit(f, '\\.')[[1]][1], enhancer=paste(seqnames, ':', start, '-', end, sep=''), promoter.loc=paste(tss.seqnames, tss.start, sep=':'))) %>%
+    Reduce(rbind, .) %>%
+    makeGRangesFromDataFrame(keep.extra.columns=T)
+he$enh_width <- width(he)
+
+# match mutations against prom-enh pairs, remove dups from diff cell lines, multiple muts in region (OK??)
+dna_he <- match_regions(dna_all, he) # %>% as.data.frame %>% filter(., ! duplicated(.$enhancer, .$promoter.loc, .$barcode))
+
+count_enh <- function (v) v %>% as.data.frame %>%
+      select(promoter, enhancer, mut_start, enh_width) %>%
+      unique %>%
+      group_by(promoter) %>%
+      summarise(nenh=length(enhancer), wenh=sum(enh_width), renh=length(enhancer)/sum(enh_width))
+
+he_prom <- he %>% as.data.frame %>%
+    group_by(promoter) %>%
+    summarise(n_enh=length(enhancer), w_enh=sum(enh_width))
+
+dna_he_sum <- dna_he %>%
+    as.data.frame %>%
+    group_by(promoter, barcode, rnd) %>%
+    summarise(n_enh=length(enhancer), w_enh=sum(enh_width), r_enh=length(enhancer)/sum(enh_width))
+
+dna_he_sum2 <- dna_he_sum %>%
+    select(-w_enh, -r_enh) %>%
+    spread(rnd, n_enh, fill=0) %>%
+    group_by(promoter, barcode) %>%
+    summarise(ne.sample=sum(`FALSE`), ne.random=sum(`TRUE`)) %>%
+    mutate(nef=ne.sample/(ne.sample+ne.random), both=ne.sample>0 & ne.random>0)
+
+dna_he_sum2 %>% filter(both) %>% ggplot(aes(x=nef)) + geom_histogram(binwidth=0.05)
+dna_he_sum2 %>% group_by(promoter) %>% summarise(n=length(barcode), fmean=mean(nef)) %>% ggplot(aes(x=fmean)) + geom_histogram(binwidth=0.05)
+dna_he_sum2 %>% group_by(promoter) %>% summarise(n=length(barcode), fmean=mean(nef)) %>% ggplot(aes(x=fmean, y=log10(n))) + geom_density2d()
+
+# most mutated in donor vs. random
+dna_he_prom %>% filter(n>10) %>% arrange(desc(fmean)) %>% head(200) %>% .$promoter %>% write.table(file='dna_he_prom.txt',row.names=F, col.names=F,quote=F)
+# GO terms w/lowest p-values
+#type B pancreatic cell apoptotic process
+#positive regulation of epithelial cell apoptotic process
+#positive regulation of type B pancreatic cell apoptotic process
+#regulation of type B pancreatic cell apoptotic process
+#regulation of epithelial cell apoptotic process
+#epithelial cell apoptotic process
+dna_he_mx <- dna_he_sum %>%
+    select(-w_enh, -r_enh) %>%
+    rename(ne_sample=n_enh) %>%
+    left_join(he_prom %>% select(-w_enh) %>% rename(ne_prom=n_enh)) %>% ==
+    mutate(fne=ne_sample/ne_prom) %>%
+    select(-ne_sample,-ne_prom) %>%
+    filter(!is.na(promoter)) %>%
+    spread(promoter, fne, fill=0)
+
+dna_he_mx  %>%
+    mutate(rnd=ifelse(rnd,1,0)) %>%
+    select(-barcode) %>%
+    write.table('dna_he_mx.csv',row.names=F,sep=',',quote=F)
+
+#
+# trying motif PWM scoring
+#
+
+query(MotifDb,'ZBTB33')[[1]] -> pwm
+subsetByOverlaps(dna, tfbs[1,]) -> muts
+hs <- getBSgenome("BSgenome.Hsapiens.UCSC.hg19")
+
+motifs <- levels(mcols(tfbs)$gene) %>% sapply(function (tf) MotifDb::query(MotifDb, tf)) %>%
+  sapply(. %>% subset(organism=='Hsapiens'))
+motifs <- motifs[sapply(motifs, length) > 0] %>% sapply(. %>% .[[1]])
+
+names(motifs) # 94 of 161
+
+
+best_score <- function (pwm, string, min.score='50%') {
+  pfm <- round(pwm*100)
+  d <- (nchar(string) - 2*dim(pwm)[2] - 1) / 2
+  if (d > 0) {
+    string <- substring(string, d + 1, nchar(string) - d)
+  }
+  max(mcols(matchPWM(pfm, string, with.score=T, min.score=min.score))$score/maxScore(pfm), 0)
+}
+
+best_motif <- function (motifs, string, min.score='50%') sapply(motifs,
+  . %>% best_score(string, min.score=min.score)) %>% sort(decreasing=T) %>% head(1)
+
+mutation_delta <- function (motifs, mut, min.score='50%') {
+  refdna <- mut$near[[1]]
+  bestref <- best_motif(motifs, refdna, min.score=min.score)
+  refdna[floor(nchar(refdna)/2)+1] <- as(levels(mut$var_allele)[mut$var_allele], 'DNAString')
+  bestmut <- best_score(motifs[[names(bestref)]], refdna, min.score=min.score)
+  bestmut - bestref
+}
+
+#
+# trying simpler approach with single TF match per
+#
+motifs <- subset(MotifDb, organism=='Hsapiens')
+motif2 <- sapply(levels(tfbs$gene)[unique(tfbs$gene)], function(tf) head(MotifDb::query(motifs, tf),1))
+motif2 <- motif2[sapply(motif2, length)>0] %>% sapply(function (m) round(m[[1]]*100))
+tfbs2 <- tfbs[tfbs$gene %in% names(motif2)]
+dna_tf2 <- match_regions(tfbs2, makeGRangesFromDataFrame(dna_all, keep.extra.columns = T))
+dna_tf2$near <- as.character(getSeq(hs, dna_tf2+30))
+dna_tf2$var_allele <- sub('-','',dna_tf2$var_allele) # get rid of - symbols
+dna_tf2$var_allele <- sub('+','',dna_tf2$var_allele) # get rid of + symbols
+
+best_score2 <- function (pfm, string) {
+  d <- (nchar(string) - 2*dim(pfm)[2] - 1) / 2
+  if (d > 0) {
+    string <- substring(string, d + 1, nchar(string) - d)
+  }
+  max(mcols(matchPWM(pfm, string, with.score=T, min.score='50%'))$score/maxScore(pfm), 0)
+}
+
+mutation_delta2 <- function(motifs, mut) {
+  pfm <- motifs[[as.character(mut$gene)]]
+  refdna <- mut$near
+  refscore <- best_score2(pfm, refdna)
+  n = floor(nchar(refdna)/2)
+  mutdna <- paste(substring(refdna,1,n), as.character(mut$var_allele), substring(refdna, n+1, 2*n+1), sep='')
+  mutscore <- best_score2(pfm, mutdna)
+  mutscore - refscore  
+}
+
+# try with a small sample
+d <- dna_tf2[sample(9390551, 1000)]
+system.time(d$tfdelta <- unlist(foreach(i=1:1000) %do% mutation_delta2(motif2, d[i,])))
+d %>% as.data.frame %>% ggplot(aes(x=tfdelta)) + geom_histogram(binwidth=0.05) + facet_grid(rnd ~ .)
+# essentially same distribution for rnd & not
+# itneresting peaks around +/- 0.5 - maybe some TF that has simple matrix?
+# todo: include TF name as well
+
+# run it all!!
+system.time(dna_tf2_delta <-
+  foreach(i=1:length(dna_tf2$near), .packages=c('BSgenome', 'magrittr')) %dopar% mutation_delta2(motif2, dna_tf2[i,]))
+dna_tf2$tfdelta <- unlist(dna_tf2_delta)
